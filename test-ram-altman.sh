@@ -60,6 +60,7 @@ mem 16000000 300000 1600001 100000 800000 100000 100000
 echo 2000-01-01 > "$work/state/last_sent"
 touch "$work/fail"
 "$script" 2>/dev/null; check "failed send exits non-zero" "$?" 1
+check "failed send releases lock" "$([[ -d "$work/state/run.lock" ]] && echo yes || echo no)" no
 check "failed send not recorded" "$(cat "$work/state/last_sent")" 2000-01-01
 rm "$work/fail"
 "$script"; check "retry succeeds" "$(sent)" 3
@@ -76,15 +77,80 @@ mem 16000000 300000 9000000 200000 8000000 500000 100000
 for _ in $(seq 40); do echo 2000-01-01 > "$work/state/last_sent"; "$script"; done
 awk 'BEGIN{RS="=====END=====\n"} NF{n=split($0,l,"\n"); for(i=1;i<=n;i++) if(l[i]=="Hi Sam,"){b=l[i+2]; print b}}' \
     "$work/outbox" > "$work/bodies"
-check "all opening lines used" "$(head -n 10 "$work/bodies" | sort -u | wc -l)" 10
-check "no back-to-back repeat" "$(uniq -d "$work/bodies" | wc -l)" 0
+check "all opening lines used" "$(head -n 10 "$work/bodies" | sort -u | wc -l | tr -d ' ')" 10
+check "no back-to-back repeat" "$(uniq -d "$work/bodies" | wc -l | tr -d ' ')" 0
 
 # Config errors.
 RAM_ALTMAN_TO='' "$script" 2>/dev/null; check "missing recipient refused" "$?" 1
 
-echo; echo "$pass passed, $fail failed"
-echo; echo "--- real machine status ---"; RAM_ALTMAN_MEMINFO=/proc/meminfo "$script" --status
+# Force the Darwin path with stock command fixtures, even on Linux.
+cat > "$work/bin/uname" <<'EOF'
+#!/bin/bash
+echo Darwin
+EOF
+cat > "$work/bin/sysctl" <<'EOF'
+#!/bin/bash
+[[ "${FAIL_SYSCTL:-}" ]] && exit 1
+echo 17179869184
+EOF
+cat > "$work/bin/vm_stat" <<'EOF'
+#!/bin/bash
+[[ "${FAIL_VM_STAT:-}" ]] && exit 1
+cat "$RAM_ALTMAN_VM_FIXTURE"
+EOF
+chmod +x "$work/bin/uname" "$work/bin/sysctl" "$work/bin/vm_stat"
+export RAM_ALTMAN_VM_FIXTURE="$work/vm_stat"
+mac_mem() {
+    cat > "$work/vm_stat" <<EOF
+Mach Virtual Memory Statistics: (page size of $1 bytes)
+Pages free: 65536.
+Pages active: 262144.
+Pages inactive: 131072.
+Pages speculative: 65536.
+Pages purgeable: 65536.
+Pages occupied by compressor: 65536.
+EOF
+}
+mac_status() { RAM_ALTMAN_MEMINFO='' "$script" --status; }
+mac_mem 16384
+out=$(mac_status)
+check "Darwin total from hw.memsize" "$(awk '/^Total:/ {print $2, $3}' <<<"$out")" "16.0 GiB"
+check "16 KiB pages, no purgeable double counting" "$(awk '/^Available:/ {print $2, $3}' <<<"$out")" "4.0 GiB"
+check "Darwin used excludes estimated available" "$(awk '/^Used:/ {print $2, $3}' <<<"$out")" "12.0 GiB"
+out=$(RAM_ALTMAN_MEMINFO='' "$script" --dry-run)
+check "Darwin email labels estimate" "$(grep -q 'estimated' <<<"$out" && echo yes || echo no)" yes
+mac_mem 4096
+out=$(mac_status)
+check "4 KiB pages" "$(awk '/^Available:/ {print $2, $3}' <<<"$out")" "1.0 GiB"
+FAIL_SYSCTL=1 mac_status >/dev/null 2>&1; check "sysctl failure refused" "$?" 1
+FAIL_VM_STAT=1 mac_status >/dev/null 2>&1; check "vm_stat failure refused" "$?" 1
+echo malformed > "$work/vm_stat"
+mac_status >/dev/null 2>&1; check "malformed vm_stat refused" "$?" 1
+mac_mem 1048576
+out=$(mac_status)
+check "available clamped to total" "$(awk '/^Available:/ {print $2, $3}' <<<"$out")" "16.0 GiB"
+
+for threshold in -1 101 nope '1+2'; do
+    RAM_ALTMAN_THRESHOLD="$threshold" "$script" --status >/dev/null 2>&1
+    check "invalid threshold $threshold refused" "$?" 1
+done
+# An overlapping process cannot sample or send, even without flock.
+mac_mem 16384
+before=$(wc -l < "$work/state/usage.csv")
+mkdir "$work/state/run.lock"
+RAM_ALTMAN_MEMINFO='' "$script"
+check "held lock skips sample" "$(wc -l < "$work/state/usage.csv")" "$before"
+rmdir "$work/state/run.lock"
+mac_state="$work/mac state"
+RAM_ALTMAN_MEMINFO='' RAM_ALTMAN_STATE_DIR="$mac_state" "$script" --dry-run >/dev/null
+check "dry run creates no state" "$([[ -e "$mac_state" ]] && echo yes || echo no)" no
+RAM_ALTMAN_MEMINFO='' RAM_ALTMAN_STATE_DIR="$mac_state" "$script"
+check "Darwin sample logged in path with spaces" "$(tail -n 1 "$mac_state/usage.csv" | cut -d, -f4)" 4194304
+check "lock released on exit" "$([[ -d "$mac_state/run.lock" ]] && echo yes || echo no)" no
+rm "$work/bin/uname" "$work/bin/sysctl" "$work/bin/vm_stat"
+
 echo; echo "--- sample dry run ---"
 mem 16000000 300000 9000000 200000 8000000 500000 100000
 "$script" --dry-run
+echo; echo "$pass passed, $fail failed"
 exit "$fail"

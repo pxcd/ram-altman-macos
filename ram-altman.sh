@@ -12,7 +12,8 @@
 #   */5 * * * * /path/to/ram-altman.sh
 #
 # How "used" is worked out:
-#   used = MemTotal - MemAvailable
+#   Linux: used = MemTotal - MemAvailable
+#   macOS: available is estimated from free + inactive + speculative pages.
 #
 #   MemAvailable is the kernel's own estimate of how much memory can be handed
 #   to new programs without swapping. It covers free memory plus the page cache
@@ -21,6 +22,8 @@
 #   which makes it more accurate than simply adding "free" and "cached" together.
 
 set -euo pipefail
+export LC_ALL=C
+umask 077
 
 # ----- Settings: fill these in -----------------------------------------------
 RECIPIENT="${RAM_ALTMAN_TO:-}"             # Who receives the email
@@ -29,8 +32,14 @@ SENDER_NAME="${RAM_ALTMAN_FROM_NAME:-}"    # Display name, optional
 THRESHOLD_PCT="${RAM_ALTMAN_THRESHOLD:-10}" # Email when available is above this
 # -----------------------------------------------------------------------------
 
+PLATFORM=$(uname -s)
 MEMINFO="${RAM_ALTMAN_MEMINFO:-/proc/meminfo}"
-STATE_DIR="${RAM_ALTMAN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ram-altman}"
+if [[ "$PLATFORM" == Darwin ]]; then
+    DEFAULT_STATE_DIR="$HOME/Library/Application Support/ram-altman"
+else
+    DEFAULT_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ram-altman"
+fi
+STATE_DIR="${RAM_ALTMAN_STATE_DIR:-$DEFAULT_STATE_DIR}"
 USAGE_LOG="$STATE_DIR/usage.csv"
 LAST_SENT_FILE="$STATE_DIR/last_sent"
 MAX_LOG_BYTES=$((10 * 1024 * 1024))   # Trim the log once it passes 10 MiB
@@ -46,6 +55,50 @@ die() {
 
 # Sets: total_kb, available_kb, used_kb, free_kb, cache_kb, available_pct
 read_memory() {
+    if [[ "$PLATFORM" == Darwin && -z "${RAM_ALTMAN_MEMINFO:-}" ]]; then
+        read_macos_memory
+    else
+        read_linux_memory
+    fi
+    used_kb=$(( total_kb - available_kb ))
+    available_pct=$(awk -v a="$available_kb" -v t="$total_kb" \
+        'BEGIN { printf "%.1f", a * 100 / t }')
+}
+
+read_macos_memory() {
+    local total_bytes stats figures
+    total_bytes=$(sysctl -n hw.memsize) || die "cannot read hw.memsize"
+    [[ "$total_bytes" =~ ^[0-9]+$ ]] || die "invalid hw.memsize"
+    stats=$(vm_stat) || die "cannot read vm_stat"
+    figures=$(printf '%s\n' "$stats" | awk -v bytes="$total_bytes" '
+        /page size of [0-9]+ bytes/ {
+            for (i = 1; i <= NF; i++) if ($i == "bytes)") page = $(i-1)
+        }
+        /^Pages (free|inactive|speculative):/ {
+            value = $3
+            sub(/\.$/, "", value)
+            if (value !~ /^[0-9]+$/) bad = 1
+            count[$2] = value
+        }
+        END {
+            if (bad || page <= 0 || bytes <= 0 ||
+                !("free:" in count) || !("inactive:" in count) ||
+                !("speculative:" in count)) exit 1
+            total = int(bytes / 1024)
+            free = count["free:"] * page / 1024
+            cache = (count["inactive:"] + count["speculative:"]) * page / 1024
+            available = free + cache
+            if (available > total) available = total
+            printf "%.0f %.0f %.0f %.0f\n", total, available, free, cache
+        }
+    ') || die "invalid vm_stat output"
+    # vm_stat subtracts speculative pages from its displayed free count.
+    # Purgeable pages overlap other queues, so do not add them again.
+    read -r total_kb available_kb free_kb cache_kb <<< "$figures"
+    (( total_kb > 0 )) || die "invalid physical memory size"
+}
+
+read_linux_memory() {
     [[ -r "$MEMINFO" ]] || die "cannot read $MEMINFO (this script needs Linux)"
 
     read -r total_kb available_kb free_kb cache_kb < <(
@@ -69,10 +122,6 @@ read_memory() {
     )
 
     (( total_kb > 0 )) || die "could not find MemTotal in $MEMINFO"
-
-    used_kb=$(( total_kb - available_kb ))
-    available_pct=$(awk -v a="$available_kb" -v t="$total_kb" \
-        'BEGIN { printf "%.1f", a * 100 / t }')
 }
 
 to_gib() {
@@ -88,7 +137,12 @@ print_status() {
     printf 'Used:       %s\n' "$(to_gib "$used_kb")"
     printf 'Available:  %s (%s%%)\n' "$(to_gib "$available_kb")" "$available_pct"
     printf '  Free:     %s\n' "$(to_gib "$free_kb")"
-    printf '  Cache:    %s\n' "$(to_gib "$cache_kb")"
+    if [[ "$PLATFORM" == Darwin && -z "${RAM_ALTMAN_MEMINFO:-}" ]]; then
+        printf '  Inactive + speculative: %s\n' "$(to_gib "$cache_kb")"
+        printf 'Available is an estimate: free + inactive + speculative pages.\n'
+    else
+        printf '  Cache:    %s\n' "$(to_gib "$cache_kb")"
+    fi
 }
 
 log_sample() {
@@ -117,7 +171,16 @@ pick() {
 
     bag="$STATE_DIR/bag_$name"
     if [[ ! -s "$bag" ]]; then
-        seq 0 $(( count - 1 )) | shuf > "$bag"
+        # Fisher-Yates in stock awk; macOS does not ship GNU shuf.
+        awk -v n="$count" -v seed="$RANDOM" 'BEGIN {
+            srand(seed)
+            for (i = 0; i < n; i++) a[i] = i
+            for (i = n - 1; i > 0; i--) {
+                j = int(rand() * (i + 1))
+                tmp = a[i]; a[i] = a[j]; a[j] = tmp
+            }
+            for (i = 0; i < n; i++) print a[i]
+        }' > "$bag"
         # Stop the last pick of the old round opening the new one.
         last=$(cat "$bag.last" 2>/dev/null || true)
         if [[ "$(head -n 1 "$bag")" == "$last" ]] && (( count > 1 )); then
@@ -141,6 +204,9 @@ compose_email() {
     total=$(to_gib "$total_kb")
     available=$(to_gib "$available_kb")
     pct=$available_pct
+    if [[ "$PLATFORM" == Darwin && -z "${RAM_ALTMAN_MEMINFO:-}" ]]; then
+        available="$available (estimated)"
+    fi
 
     local subjects=(
         "Good news: we found some RAM"
@@ -169,6 +235,10 @@ compose_email() {
         "I have a confession. I have $available of RAM that I'm not using, which is $pct% of the $total in this PC. I've told nobody but you and a cron job."
         "If $available of RAM sits idle in a PC and nobody allocates it, does it still count as capacity? Asking on behalf of the $pct% of my memory with nothing to do."
     )
+
+    if [[ "$PLATFORM" == Darwin && -z "${RAM_ALTMAN_MEMINFO:-}" ]]; then
+        bodies[5]="Before you ask: this Mac estimates available RAM from free, inactive and speculative pages. That leaves $available of $total potentially up for grabs. The memory pressure graph has declined to comment."
+    fi
 
     local signoffs=(
         "Yours in abundance,"
@@ -224,6 +294,9 @@ send_email() {
 }
 
 main() {
+    [[ "$THRESHOLD_PCT" =~ ^[0-9]{1,3}$ ]] || die "threshold must be an integer from 0 to 100"
+    THRESHOLD_PCT=$((10#$THRESHOLD_PCT))
+    (( THRESHOLD_PCT <= 100 )) || die "threshold must be an integer from 0 to 100"
     case "${1:-}" in
         --status)
             read_memory
@@ -261,11 +334,14 @@ main() {
 
     mkdir -p "$STATE_DIR"
 
-    # Stop overlapping runs from both sending today's email.
-    if command -v flock > /dev/null; then
-        exec 9> "$STATE_DIR/lock"
-        flock -n 9 || exit 0
+    # mkdir is atomic on both platforms; macOS does not ship flock.
+    if ! mkdir "$STATE_DIR/run.lock" 2>/dev/null; then
+        [[ -d "$STATE_DIR/run.lock" ]] && exit 0
+        die "cannot create lock in $STATE_DIR"
     fi
+    trap 'rmdir "$STATE_DIR/run.lock"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     read_memory
     log_sample

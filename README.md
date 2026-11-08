@@ -1,4 +1,6 @@
-# Ram-Altman
+# Ram-Altman for macOS
+
+A macOS port of [IainKay/ram-altman](https://github.com/IainKay/ram-altman), with Linux support preserved. Runs with the Bash 3.2 and BSD tools shipped by macOS; no Homebrew dependencies.
 
 **A bash script that writes to Sam Altman once a day to report the RAM he missed.**
 
@@ -31,7 +33,7 @@ So we wrote a script. If your machine has more than 10% of its RAM available, it
 - Sends at most one email per day, because we're hoarders, not animals
 - Rotates 8 subject lines, 10 messages and 6 sign-offs, so the joke gets old at a carefully managed pace
 - Logs every sample to CSV for when the auditors arrive
-- Ships with 14 tests, more than the DRAM market has had sensible outcomes
+- Tests Linux and macOS memory accounting, delivery limits, failure handling and locking
 - Is written in bash, as an Electron version would have solved the problem by using all the RAM
 
 ## A sample of today's correspondence
@@ -55,7 +57,22 @@ Reply if you'd like it to stop.
 
 The figures are real. They come from your machine. That's the worrying part.
 
-## What counts as "used"?
+## macOS memory accounting
+
+On macOS, total RAM comes from `sysctl -n hw.memsize`. Available RAM is
+**estimated** as free + inactive + speculative pages from `vm_stat`, using the
+page size in its header (including 4 KiB Intel and 16 KiB Apple Silicon pages).
+Used RAM is total minus that estimate. Inactive pages can include anonymous
+memory that needs compression or swapping, so this is not a promise that all
+of it can be allocated without swapping, nor an Activity Monitor replica.
+
+`vm_stat` displays free pages with speculative pages subtracted, so adding
+speculative pages here counts them once. Purgeable pages overlap the other
+queues and are not added again. Compressed and wired memory count as used.
+See [Apple’s vm_stat implementation](https://github.com/apple-oss-distributions/system_cmds/blob/main/vm_stat/vm_stat.c).
+The status output labels the estimate explicitly.
+
+## Linux memory accounting
 
 ```text
 used = MemTotal - MemAvailable
@@ -71,11 +88,13 @@ On kernels older than 3.14, which have no `MemAvailable`, the script estimates i
 
 ## Installation
 
-You'll need Linux, bash, and a working `sendmail`, `msmtp` or `mail` command. Your RAM is assumed.
+You'll need macOS or Linux and bash. Status and dry runs need no mail setup.
+Actual sending requires a configured `sendmail`, `msmtp` or `mail` transport;
+the macOS mail binaries alone do not provide a working SMTP account.
 
 ```bash
-git clone https://github.com/IainKay/ram-altman.git
-cd ram-altman
+git clone https://github.com/pxcd/ram-altman-macos.git
+cd ram-altman-macos
 chmod +x ram-altman.sh test-ram-altman.sh
 
 ./ram-altman.sh --status    # see the evidence against you
@@ -110,7 +129,42 @@ It samples every five minutes and emails at most once a day. If a send fails, it
 | `RAM_ALTMAN_FROM` | A real address you can send from | Required |
 | `RAM_ALTMAN_FROM_NAME` | Your name, or your nom de RAM | Optional |
 | `RAM_ALTMAN_THRESHOLD` | Email when available RAM is above this percentage (whole number) | `10` |
-| `RAM_ALTMAN_STATE_DIR` | Where the log and state files live | `~/.local/state/ram-altman` |
+| `RAM_ALTMAN_STATE_DIR` | Where the log and state files live | macOS: `~/Library/Application Support/ram-altman`; Linux: `${XDG_STATE_HOME:-~/.local/state}/ram-altman` |
+
+On macOS you can also schedule it as a user LaunchAgent. Save the following as
+`~/Library/LaunchAgents/lol.ram-altman.plist`, replacing the absolute script path
+and example addresses. XML-escape values containing `&`, `<` or `>`.
+This is opt-in: cloning or running tests installs no job and sends no real email.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>lol.ram-altman</string>
+    <key>ProgramArguments</key>
+    <array><string>/absolute/path/to/ram-altman.sh</string></array>
+    <key>StartInterval</key><integer>300</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>RAM_ALTMAN_TO</key><string>recipient@example.com</string>
+        <key>RAM_ALTMAN_FROM</key><string>you@example.com</string>
+        <key>RAM_ALTMAN_FROM_NAME</key><string>Your Name</string>
+    </dict>
+</dict>
+</plist>
+```
+
+Load it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/lol.ram-altman.plist`.
+Stop it with `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/lol.ram-altman.plist`.
+It samples while you are logged in; missed intervals during sleep are not replayed.
+
+Overlapping runs use an atomic directory lock on both platforms. If the process
+is forcibly killed or the machine loses power, first ensure no instance is still
+running, then remove the empty `run.lock` directory inside the state directory
+with `rmdir`. It is deliberately not stolen automatically while a mailer might
+still be sending.
 
 ## Audit yourself
 
@@ -119,7 +173,7 @@ Let it run for a while, then find out how your machine compares:
 ```bash
 awk -F, 'NR>1 { used += $3; total += $2 }
   END { if (total) printf "Your RAM in use: %.1f%% (the claim: maybe 5%%)\n", used * 100 / total }' \
-  ~/.local/state/ram-altman/usage.csv
+  "$HOME/Library/Application Support/ram-altman/usage.csv"
 ```
 
 Yes, share of memory in use isn't the same thing as share of time spent in use. If you came here to say that, welcome to Hacker News. We're glad you're here.
@@ -144,7 +198,7 @@ No.
 The memory accounting is. The correspondence isn't.
 
 **Does it work on macOS?**
-No, it reads `/proc/meminfo`. On the other hand, your RAM is probably soldered down, which makes you the hardest target in the global allocation programme.
+Yes. This fork reads `vm_stat` and `sysctl` on macOS and `/proc/meminfo` on Linux. Your soldered RAM remains the hardest target in the global allocation programme.
 
 **Why is the threshold 10%?**
 Below that, your machine has suffered enough.
