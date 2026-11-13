@@ -29,3 +29,5 @@ The initial bootstrap PR must receive CI and a real review before landing. Requi
 The default-branch workflow uploads an immutable v4 artifact containing the owner/model/report/PR/head/base/run identity before publishing a passing check. Revalidation retrieves that artifact from its producing owner-dispatched run and rejects missing, expired, malformed or mismatched artifacts. The newest dispatch identity wins, not the check creation time. Reruns cannot create new attestations; use a fresh dispatch. Successful artifact upload plus final check publication is the attestation transaction; later cancellation of the workflow does not automatically revoke that recorded review. Record an explicit failure to revoke it.
 
 The gate trusts repository-owner attestations and trusted Actions automation. It does not defend against an administrator changing the rules or a compromised write-capable Actions token directly forging any GitHub-Actions-sourced required check. Ordinary CI remains read-only; privileged gate code always comes from the default branch. No PR code is run with a write token.
+
+<!-- Temporary deployment verification: this PR is closed without merging. -->
