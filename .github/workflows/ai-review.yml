@@ -1,0 +1,65 @@
+name: AI review gate
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number
+        required: true
+      head:
+        description: Exact reviewed PR head SHA
+        required: true
+      base:
+        description: Exact reviewed base SHA
+        required: true
+      model:
+        description: Reviewer model identity
+        required: true
+      verdict:
+        description: Review result
+        type: choice
+        options: [pass, fail]
+        required: true
+      report:
+        description: Existing AI review report (max 20KB)
+        required: true
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+  checks: write
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: false
+jobs:
+  gate:
+    name: Record or validate AI review
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Never check out or execute the PR's code with a write-capable token.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        id: prepare
+        with:
+          script: |
+            const { handle } = require('./.github/scripts/ai-review.cjs');
+            await handle({ github, context, core, phase: context.eventName === 'workflow_dispatch' ? 'prepare' : 'gate' });
+      - if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.prepare.outputs.artifact_name }}
+          path: review.json
+          if-no-files-found: error
+          retention-days: 90
+      - if: github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const { handle } = require('./.github/scripts/ai-review.cjs');
+            await handle({ github, context, core, phase: 'publish' });
